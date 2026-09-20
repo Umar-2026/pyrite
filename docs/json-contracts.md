@@ -99,11 +99,34 @@ Source of truth: `pyrite/server/endpoints/repos.py` (`_relativize_path`,
 }
 ```
 
-`count` is `len(results)`, not a total-matches count — there is no
-separate total. Paginated list endpoints (`kb_list_entries`,
-`kb_recent`, `kb_backlinks`, `kb_tags`) instead include `has_more: bool`
-(`True` when the page was full, i.e. more may exist past this page —
-not an exact remaining count).
+`count` is `len(results)`, not a total-matches count for search results —
+none of `search`'s three transports return a separate total. `has_more`
+and a separate `total` are not uniform across the paginated surfaces or
+across transports; measured per surface (CLI `--format json`, MCP tool,
+REST `GET`):
+
+| surface | CLI | MCP | REST |
+|---|---|---|---|
+| `search` | neither | `has_more` (no `total`) | neither |
+| `list_entries` | `has_more` + `total` | `has_more` + `total` | `total`, no `has_more` |
+| `recent` | neither | neither | no REST route |
+| `tags` | neither | `has_more` (no `total`) | neither |
+| `backlinks` | `total`, no `has_more` | `has_more` (no `total`) | no REST route |
+
+Where present, `has_more` means the page was full (`len(page) == limit`
+for CLI/MCP `tags`/`recent`, or `offset + limit < total` where a total is
+computed) — a signal to fetch the next page, not an exact remaining
+count. Don't assume either key exists; check for it.
+
+The result array's key also differs by transport for the same logical
+call: CLI `backlinks` → `entries`, MCP `kb_backlinks` → `backlinks`; CLI
+`tags` → `count` + `tags`, MCP `kb_tags` → `tag_count` + `tags`.
+
+Source of truth: `pyrite/server/mcp_server.py` (`_kb_search`,
+`_kb_list_entries`, `_kb_recent`, `_kb_backlinks`, `_kb_tags`);
+`pyrite/server/endpoints/search.py` (`search`), `pyrite/server/endpoints/entries.py`
+(`list_entries`) and `pyrite/server/endpoints/tags.py` (`get_tags`) for REST;
+`pyrite/cli/browse_commands.py` for the CLI commands' own JSON assembly.
 
 ## Entry envelope
 
@@ -130,6 +153,51 @@ entry dict gains:
 don't assume its absence means anything other than "not truncated".
 Use `kb_read_body` (offset-based continuation) to read past the first
 chunk; stop once `body_offset + body_chunk_size >= body_length`.
+
+The four keys survive a `fields` projection that kept `body`: a bounded
+body always arrives with the means to tell it was bounded (ADR-0034 rule
+2). A projection that excluded `body` carries none of them.
+
+### `body_chunk_size: 0` in a multi-entry read
+
+`kb_batch_read`, and the other tools that return several bodies, spend a
+per-response budget (`PYRITE_BODY_RESPONSE_BUDGET`, default 40,000
+characters) in request order. An entry reached after the budget is spent
+comes back **in place, with an empty body and the full marker**:
+
+```json
+{
+  "id": "some-entry",
+  "body": "",
+  "body_truncated": true,
+  "body_length": 50000,
+  "body_offset": 0,
+  "body_chunk_size": 0
+}
+```
+
+It is not dropped from `entries` and never appears in `not_found` —
+`body_length` is its true length, so a caller can see there was content
+and fetch it with `kb_read_body`. A loop that advances by
+`body_chunk_size` must treat `0` as "this call returned nothing, ask
+again for this entry alone" rather than incrementing by zero forever.
+
+### Writing a body back
+
+**A truncated body is never valid input to a write** (ADR-0034 rule 2).
+Every write path that can receive a body — MCP (`kb_create`, `kb_update`,
+`kb_bulk_create`, `task_create`, …), REST (`POST`/`PUT`/`PATCH
+/api/entries`, `POST /api/entries/import`) and the CLI (`pyrite create`,
+`pyrite update`, `pyrite import`) — refuses a request carrying a truthy
+`body_truncated` alongside a `body`, with `VALIDATION_FAILED` and
+`retryable: false`. Writing back what a bounded read returned would
+replace the whole stored body with the chunk you were given.
+
+Assemble the full body first (`kb_read_body` paged by `body_offset`, or a
+`body_limit` above `body_length`) and write that, without the marker. To
+change other fields without touching the body, omit `body` — a request
+carrying the marker but no body is allowed. `body_truncated: false` is
+allowed, and is never persisted as entry content.
 
 ## Exit codes (CLI)
 
